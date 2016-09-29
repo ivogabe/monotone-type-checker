@@ -1,0 +1,21 @@
+{
+  "name": "monotone-type-checker",
+  "version": "0.1.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc -p src",
+    "test": "ava dist/test",
+    "demo": "node dist/lib/demo",
+    "runner": "node dist/lib/runner"
+  },
+  "author": "Ivo Gabe de Wolff",
+  "license": "MIT",
+  "dependencies": {
+    "typescript": "^2.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^6.0.41",
+    "ava": "^0.15.2"
+  }
+}

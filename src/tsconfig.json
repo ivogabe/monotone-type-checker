@@ -1,0 +1,15 @@
+{
+	"compilerOptions": {
+		"target": "es6",
+		"module": "commonjs",
+		"noImplicitAny": true,
+		"strictNullChecks": true,
+		"rootDir": "./",
+		"outDir": "../dist",
+		"types": ["node"],
+		"declaration": true,
+		"pretty": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true
+	}
+}
