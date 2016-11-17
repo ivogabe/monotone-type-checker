@@ -1,15 +1,19 @@
 import * as ts from "typescript";
 import { all, some, mapMap } from "./utils";
 
+declare module "typescript" {
+	function isPartOfExpression(node: ts.Node): boolean;
+}
+
 export interface TypeHost {
 	instantiateCache: InstantiationCache;
-	globalObject: ObjectType;
-	globalArray: ObjectType;
-	globalNumber: ObjectType;
-	globalString: ObjectType;
-	globalBoolean: ObjectType;
-	globalSymbol: ObjectType;
-	globalFunction: ObjectType;
+	rootType: (name: string) => Type | undefined;
+	globalObject: LazyType<ObjectType>;
+	globalArray: LazyType<ObjectType>;
+	globalNumber: LazyType<ObjectType>;
+	globalString: LazyType<ObjectType>;
+	globalBoolean: LazyType<ObjectType>;
+	globalFunction: LazyType<ObjectType>;
 }
 
 export enum IndexerKind {
@@ -40,7 +44,8 @@ export abstract class TypeBase {
 }
 export type NonUnionIntersectionType = PrimitiveType | EnumType | ObjectType | LiteralType | TypeParameter | FunctionType;
 export type NonUnionType = NonUnionIntersectionType | IntersectionType;
-export type Type = NonUnionType | UnionType;
+export type ResolvedType = NonUnionType | UnionType;
+export type Type = ResolvedType | LazyType<ResolvedType>;
 export enum PrimitiveKind {
 	Void,
 	Undefined,
@@ -48,7 +53,6 @@ export enum PrimitiveKind {
 	String,
 	Number,
 	Boolean,
-	Symbol,
 	Any
 }
 export class PrimitiveType extends TypeBase {
@@ -70,8 +74,6 @@ export class PrimitiveType extends TypeBase {
 				return "number";
 			case PrimitiveKind.Boolean:
 				return "boolean";
-			case PrimitiveKind.Symbol:
-				return "symbol";
 			case PrimitiveKind.Any:
 				return "any";
 			default:
@@ -178,10 +180,13 @@ export class LiteralType extends TypeBase {
 		return JSON.stringify(this.value);
 	}
 }
+
 export class TypeParameter extends TypeBase {
 	original: TypeParameter;
+	base: Type;
+
 	constructor(
-		public base: Type,
+		base: Type | undefined,
 		public name: string,
 		original?: TypeParameter
 	) {
@@ -190,6 +195,9 @@ export class TypeParameter extends TypeBase {
 			this.original = this;
 		} else {
 			this.original = original;
+		}
+		if (base === undefined) {
+			base = primitiveAny;
 		}
 		this.depth = base.depth;
 	}
@@ -268,6 +276,31 @@ export class FunctionArgument {
 		return result + ": " + this.type.show();
 	}
 }
+export class LazyType<T extends ResolvedType> extends TypeBase {
+	private resolved: T | undefined;
+	private resolveType: () => T | LazyType<T>;
+
+	constructor(resolve: () => T | LazyType<T>) {
+		super();
+
+		this.resolveType = resolve;
+	}
+
+	resolve(): T {
+		if (this.resolved === undefined) {
+			let type = this.resolveType();
+			if (type instanceof LazyType) {
+				type = type.resolve();
+			}
+			this.resolved = type;
+		}
+		return this.resolved;
+	}
+
+	show() {
+		return this.resolve().show();
+	}
+}
 
 export const primitiveNever = new UnionType([]);
 export const primitiveVoid = new PrimitiveType(PrimitiveKind.Void);
@@ -276,7 +309,6 @@ export const primitiveNull = new PrimitiveType(PrimitiveKind.Null);
 export const primitiveString = new PrimitiveType(PrimitiveKind.String);
 export const primitiveNumber = new PrimitiveType(PrimitiveKind.Number);
 export const primitiveBoolean = new PrimitiveType(PrimitiveKind.Boolean);
-export const primitiveSymbol = new PrimitiveType(PrimitiveKind.Symbol);
 export const primitiveAny = new PrimitiveType(PrimitiveKind.Any);
 
 export const literalStringEmpty = new LiteralType("");
@@ -291,8 +323,8 @@ export function isNever(s: Type) {
 	return s instanceof UnionType && s.unionParts.length === 0;
 }
 export function typesEqual(host: TypeHost, s: Type, t: Type) {
-	const eq = isSubtype(host, s, t) && isSubtype(host, t, s);
-	return eq;
+	if (s === t) return true;
+	return isSubtype(host, s, t) && isSubtype(host, t, s);
 }
 export function isSubtype(host: TypeHost, s: Type, t: Type): boolean {
 	if (s === t) return true;
@@ -359,7 +391,16 @@ export function isSubtype(host: TypeHost, s: Type, t: Type): boolean {
 	return false;
 }
 
+export function resolve(type: Type): ResolvedType;
+export function resolve(type: Type | undefined): ResolvedType | undefined;
+export function resolve(type: Type | undefined): ResolvedType | undefined {
+	if (type === undefined) return undefined;
+	if (type instanceof LazyType) return type.resolve();
+	return type;
+}
+
 export function unionParts(type: Type): NonUnionType[] {
+	type = resolve(type);
 	if (type instanceof UnionType) return type.unionParts;
 	return [type];
 }
@@ -468,6 +509,7 @@ export function typesOverlap(host: TypeHost, left: Type, right: Type) {
 }
 
 export function typeMap(host: TypeHost, type: Type, cb: (t: NonUnionType) => Type): Type {
+	type = resolve(type);
 	if (type instanceof UnionType) {
 		return union(host, type.unionParts.map(cb));
 	} else {
@@ -486,6 +528,7 @@ export function typeLiteralMap(host: TypeHost, type: Type, fallback: Type, cb: (
 }
 
 function widenLiterals(type: Type) {
+	type = resolve(type);
 	if (type instanceof LiteralType) {
 		if (typeof type.value === "string") return primitiveString;
 		if (typeof type.value === "number") return primitiveNumber;
@@ -517,8 +560,6 @@ export function narrowTypeAfterCondition(host: TypeHost, type: Type, trueBranch:
 				return trueBranch ? type : literalStringEmpty;
 			case PrimitiveKind.Number:
 				return trueBranch ? type : literalNumberZero;
-			case PrimitiveKind.Symbol:
-				return ifTrue;
 			default:
 				return type;
 		}
@@ -563,8 +604,6 @@ export function typeOfType(type: Type): string[] {
 				return ["number"];
 			case PrimitiveKind.Boolean:
 				return ["boolean"];
-			case PrimitiveKind.Symbol:
-				return ["symbol"];
 			case PrimitiveKind.Any:
 				return allTypeOfs;
 		}
@@ -591,6 +630,7 @@ export function typeOfTypes(types: Type[]): string[] {
 }
 
 export function filterUnion(host: TypeHost, type: Type, filter: (type: NonUnionType) => boolean): Type {
+	type = resolve(type);
 	if (type instanceof UnionType) {
 		return union(host, type.unionParts.filter(t => filter(t)));
 	}
@@ -600,6 +640,7 @@ export function filterUnion(host: TypeHost, type: Type, filter: (type: NonUnionT
 	return primitiveNever;
 }
 export function mapUnion(host: TypeHost, type: Type, callback: (type: NonUnionType) => Type): Type {
+	type = resolve(type);
 	if (type instanceof UnionType) {
 		return union(host, type.unionParts.map(callback));
 	}
@@ -629,31 +670,29 @@ export function* properties(type: ObjectType): IterableIterator<[PropertyName, T
 	}
 }
 export function propertyType(host: TypeHost, type: Type, propertyName: PropertyName): Type | undefined {
+	type = resolve(type);
 	type = widenLiterals(type);
 	if (type instanceof PrimitiveType) {
 		switch (type.kind) {
 			case PrimitiveKind.Any:
 				return primitiveAny;
 			case PrimitiveKind.Boolean:
-				type = host.globalBoolean;
+				type = host.globalBoolean.resolve();
 				break;
 			case PrimitiveKind.Number:
-				type = host.globalNumber;
+				type = host.globalNumber.resolve();
 				break;
 			case PrimitiveKind.String:
-				type = host.globalString;
-				break;
-			case PrimitiveKind.Symbol:
-				type = host.globalSymbol;
+				type = host.globalString.resolve();
 				break;
 			default:
 				// undefined, null or void
 				return primitiveNever;
 		}
 	} else if (type instanceof EnumType) {
-		type = host.globalNumber;
+		type = host.globalNumber.resolve();
 	} else if (type instanceof FunctionReference || type instanceof FunctionSignature) {
-		type = host.globalFunction;
+		type = host.globalFunction.resolve();
 	} else if (type instanceof TypeParameter) {
 		return propertyType(host, type.base, propertyName);
 	} else if (type instanceof UnionType) {
@@ -671,7 +710,10 @@ export function propertyType(host: TypeHost, type: Type, propertyName: PropertyN
 
 	const indexer = indexerForPropertyName(propertyName);
 	if (indexer !== undefined) {
-		const indexerType = getProperty(type, indexer);
+		let indexerType = getProperty(type, indexer);
+		if (indexerType === undefined && indexer.kind === IndexerKind.Number) {
+			indexerType = getProperty(type, indexerString);
+		}
 		if (indexerType !== undefined) return union(host, [indexerType, primitiveUndefined]);
 	}
 
@@ -721,6 +763,8 @@ export function mapType(host: TypeHost, type: Type, callback: (t: Type) => Type 
 			return intersect(host, intersectionParts(type).map(map));
 		} else if (type instanceof TypeParameter) {
 			return mapTypeParameter(type);
+		} else if (type instanceof LazyType) {
+			return new LazyType(() => map(type.resolve()));
 		} else {
 			return new FunctionSignature(type.isConstructor, map(type.thisType), type.typeParameters.map(mapTypeParameter) as TypeParameter[], type.args.map(mapFunctionArgument), map(type.returnType));
 		}
@@ -729,14 +773,14 @@ export function mapType(host: TypeHost, type: Type, callback: (t: Type) => Type 
 		return new FunctionArgument(argument.name, map(argument.type), argument.optional, argument.rest);
 	}
 	function mapTypeParameter(param: TypeParameter) {
-		const base = map(param.base);
-		if (base === undefined) return param;
-		return new TypeParameter(base, param.name, param.original);
+		if (param.base === undefined) return param;
+		return new TypeParameter(map(param.base), param.name, param.original);
 	}
 }
 export type InstantiationCache = WeakMap<ObjectType, WeakMap<Type, ObjectType>>;
 export function instantiateObject(host: TypeHost, type: ObjectType, parameterType: Type) {
 	if (type.typeParameters.length === 0) {
+		console.log("Cannot instantiate an object type without type parameters");
 		return type;
 	}
 	let cacheForObject = host.instantiateCache.get(type);
@@ -868,6 +912,8 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 				return fromIntersectionType(node as ts.IntersectionTypeNode);
 			case ts.SyntaxKind.LiteralType:
 				return fromLiteralType(node as ts.LiteralTypeNode);
+			case ts.SyntaxKind.TypeReference:
+				return fromTypeReference(node as ts.TypeReferenceNode);
 			default:
 				// console.log("Unexpected type node kind: " + ts.SyntaxKind[node.kind]);
 				return primitiveAny;
@@ -906,12 +952,12 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 		return new FunctionSignature(isConstructor, thisType, funcTypeParameters, funcArguments, returnType);
 	}
 	function fromArrayType(node: ts.ArrayTypeNode) {
-		return instantiateObject(host, host.globalArray, from(node.elementType));
+		return instantiateObject(host, host.globalArray.resolve(), from(node.elementType));
 	}
 	
 	function fromTypeParameterDeclaration(node: ts.TypeParameterDeclaration) {
 		return new TypeParameter(
-			from(node.constraint) || primitiveNever,
+			from(node.constraint),
 			node.name.text
 		);
 	}
@@ -929,6 +975,61 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 		// Lambda is not required here, but TypeScript
 		// gives a type error if omitted.
 		return intersect(host, node.types.map(t => from(t)));
+	}
+	function fromTypeReference(node: ts.TypeReferenceNode) {
+		const name = entityNameToString(node.typeName);
+		let type = resolve(host.rootType(name));
+		if (type === undefined) {
+			for (const t of typeParameters) {
+				if (t.name === name) {
+					type = t;
+					break;
+				}
+			}
+			if (type === undefined) {
+				type = primitiveAny;
+			}
+		}
+		if (node.typeArguments) {
+			if (type instanceof ObjectType) {
+				for (const arg of node.typeArguments) {
+					type = instantiateObject(host, type, from(arg));
+				}
+			} else {
+				console.log("Can only use type arguments with object types");
+			}
+		}
+		return type;
+	}
+}
+export function fromTsIndexer(host: TypeHost, node: ts.IndexSignatureDeclaration): PropertyName {
+	if (node.parameters.length !== 1) {
+		console.log("Invalid index signature");
+	}
+	const typeNode = node.parameters[0].type;
+	if (typeNode === undefined) {
+		return indexerString;
+	}
+	const type = fromTsType(host, typeNode);
+	
+	
+	if (type instanceof LiteralType) {
+		if (typeof type.value === "number" || typeof type.value === "string") {
+			return type.value;
+		}
+		return indexerString;
+	}
+	if (isSubtype(host, type, primitiveNumber)) {
+		return indexerNumber;
+	}
+	return indexerString;
+}
+
+export function entityNameToString(node: ts.EntityName): string {
+	if (node.kind === ts.SyntaxKind.Identifier) {
+		return node.text;
+	} else {
+		return entityNameToString(node.left) + "." + node.right.text;
 	}
 }
 
@@ -1026,6 +1127,10 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 	return signature;
 
 	function assign(to: Type, type: Type, contra: boolean): boolean {
+		if (to === type) return true;
+		to = resolve(to);
+		type = resolve(type);
+
 		if (to instanceof TypeParameter && typeArguments.has(to)) {
 			assignTypeParameter(to, type, contra);
 			return true;
@@ -1168,4 +1273,29 @@ export function propertyNamesEqual(a: PropertyName, b: PropertyName) {
 export interface NarrowingReference {
 	expression: ts.Node;
 	property: PropertyName[];
+}
+
+export function assertObjectType(type: Type | undefined, message?: string) {
+	if (type === undefined) {
+		throw new Error(message === undefined ? "Assertion failed: expected object type, got undefined" : message);
+	}
+	type = resolve(type);
+	if (!(type instanceof ObjectType)) {
+		throw new Error(message === undefined ? "Assertion failed: expected object type, got type " + type.show() : message);
+	}
+	return type;
+}
+export function propertyNameToKey(name: ts.PropertyName): PropertyName {
+	if (name.kind === ts.SyntaxKind.ComputedPropertyName) {
+		return indexerString;
+	} else if (name.kind === ts.SyntaxKind.NumericLiteral) {
+		const value = JSON.parse(name.text);
+		if (typeof value !== "number") {
+			throw new Error("Invalid numeric literal " + name.text);
+		}
+		return value;
+	} else {
+		// Identifier, StringLiteral
+		return name.text;
+	}
 }

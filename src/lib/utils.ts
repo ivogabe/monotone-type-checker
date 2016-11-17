@@ -52,3 +52,19 @@ export function isFunctionLike(node: ts.Node): node is ts.FunctionLikeDeclaratio
 	}
 	return false;
 }
+
+export function identifierIsExpression(node: ts.Identifier) {
+	const parent = node.parent;
+	if (parent === undefined) return true;
+	if (parent.kind === ts.SyntaxKind.PropertyAccessExpression) {
+		return (parent as ts.PropertyAccessExpression).name !== node;
+	}
+	if (parent.kind === ts.SyntaxKind.FunctionDeclaration) {
+		return (parent as ts.FunctionDeclaration).name !== node;
+	}
+	return true;
+}
+
+export function unreachable(value: never, message = "Assertion failed, code not unreachable"): never {
+	throw new Error(message + "\n\tvalue = " + value);
+}
