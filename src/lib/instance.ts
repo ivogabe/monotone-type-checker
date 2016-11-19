@@ -51,7 +51,7 @@ export function typeChecker(): Instance<Output> {
 			globalString:   rootObjectType("String"),
 			globalFunction: rootObjectType("Function")
 		};
-		console.log(typeHost.globalArray.show());
+
 		const typesEqual = curry(types.typesEqual, typeHost);
 		const isSubtype = curry(types.isSubtype, typeHost);
 		const propertyType = curry(types.propertyType, typeHost);
@@ -401,7 +401,7 @@ export function typeChecker(): Instance<Output> {
 				for (const type of types.intersectionParts(part)) {
 					if (type instanceof types.FunctionSignature && type.isConstructor === isNew) {
 						const match = functionSignatureMatches(type, thisType, args);
-						if (match) results.push(match.returnType);
+						if (match) results.push(types.limitFor(match.returnType, match));
 					} else if (type instanceof types.FunctionReference) {
 						let callEnv = envSetThisType(thisType, env);
 						let rest: ts.ParameterDeclaration | undefined;
@@ -614,13 +614,14 @@ export function typeChecker(): Instance<Output> {
 				const intersected = override ? narrowedPropertyType : intersect([propType, narrowedPropertyType]);
 				if (intersected === types.primitiveNever) return types.primitiveNever;
 				if (t instanceof types.ObjectType) {
-					return types.widenObject(new types.ObjectType(
+					return new types.ObjectType(
 						new Map([[property, intersected]]),
 						t,
 						t.name,
 						t.instantiatedTypeParameters,
-						t.typeParameters
-					));
+						t.typeParameters,
+						t.maxDepth
+					);
 				}
 				return types.primitiveNever;
 			});
@@ -953,7 +954,7 @@ export function typeChecker(): Instance<Output> {
 					return types.primitiveAny;
 				}
 			}
-			return types.widenObject(new types.ObjectType(members));
+			return new types.ObjectType(members);
 		}
 		function typeOfArrayLiteral(node: ts.ArrayLiteralExpression, env: Environment) {
 			const t: types.Type[] = [];
@@ -1042,7 +1043,7 @@ export function typeChecker(): Instance<Output> {
 						const nameType = getMemberDeclarationType(m, typeParameters);
 						if (nameType === undefined) continue;
 						const [name, type] = nameType;
-						members.set(name, type);
+						members.set(name, types.limitDepth(type, types.defaultMaxDepth - 1));
 					}
 
 					return new types.ObjectType(members, extendsType, name, [], typeParameters);
@@ -1058,13 +1059,12 @@ export function typeChecker(): Instance<Output> {
 				return undefined;
 			}
 			function getMemberDeclarationType(node: ts.ClassElement | ts.TypeElement, typeParameters: types.TypeParameter[]): [types.PropertyName, types.Type] | undefined {
-				node.name;
 				if (node.kind === ts.SyntaxKind.MethodDeclaration) {
 					const name = (node as ts.MethodDeclaration).name;
-					return [types.propertyNameToKey(name), types.fromTsType(typeHost, node as ts.MethodDeclaration, typeParameters)];
+					return [types.propertyNameToKey(name), new types.LazyType(() => types.fromTsType(typeHost, node as ts.MethodDeclaration, typeParameters))];
 				} else if (node.kind === ts.SyntaxKind.PropertyDeclaration || node.kind === ts.SyntaxKind.PropertySignature) {
 					const { name, type, questionToken } = node as ts.PropertyDeclaration | ts.PropertySignature;
-					let t = type === undefined ? types.primitiveAny : types.fromTsType(typeHost, type, typeParameters);
+					let t: types.Type = type === undefined ? types.primitiveAny : new types.LazyType(() => types.fromTsType(typeHost, type, typeParameters));
 					if (questionToken) {
 						t = union([t, types.primitiveUndefined]);
 					}
@@ -1072,7 +1072,7 @@ export function typeChecker(): Instance<Output> {
 				} else if (node.kind === ts.SyntaxKind.IndexSignature) {
 					const indexer = types.fromTsIndexer(typeHost, node as ts.IndexSignatureDeclaration);
 					const { type } = node as ts.IndexSignatureDeclaration;
-					return [indexer, type === undefined ? types.primitiveAny : types.fromTsType(typeHost, type, typeParameters)]
+					return [indexer, type === undefined ? types.primitiveAny : new types.LazyType(() => types.fromTsType(typeHost, type, typeParameters))];
 				}
 				return undefined;
 			}
@@ -1087,7 +1087,6 @@ export function typeChecker(): Instance<Output> {
 			return rootTypes.get(name);
 		}
 		function rootObjectType(name: string) {
-			console.log("Load " + name);
 			const type = rootType(name);
 			if (!(type instanceof types.LazyType)) {
 				console.log("Root type should be lazy type");

@@ -40,7 +40,8 @@ export function primitiveForIndexer(indexer: Indexer) {
 
 export abstract class TypeBase {
 	abstract show(): string;
-	depth = 0;
+
+	constructor(public maxDepth: number) {}
 }
 export type NonUnionIntersectionType = PrimitiveType | EnumType | ObjectType | LiteralType | TypeParameter | FunctionType;
 export type NonUnionType = NonUnionIntersectionType | IntersectionType;
@@ -57,7 +58,7 @@ export enum PrimitiveKind {
 }
 export class PrimitiveType extends TypeBase {
 	constructor(public kind: PrimitiveKind) {
-		super();
+		super(Infinity);
 	}
 
 	show() {
@@ -91,12 +92,7 @@ export class EnumType extends TypeBase {
 }
 export class UnionType extends TypeBase {
 	constructor(public unionParts: NonUnionType[]) {
-		super();
-		for (const part of unionParts) {
-			if (part.depth > this.depth) {
-				this.depth = part.depth;
-			}
-		}
+		super(Infinity);
 	}
 
 	show(): string {
@@ -106,33 +102,19 @@ export class UnionType extends TypeBase {
 }
 export class IntersectionType extends TypeBase {
 	constructor(public intersectionParts: NonUnionIntersectionType[]) {
-		super();
-		for (const part of intersectionParts) {
-			if (part.depth > this.depth) {
-				this.depth = part.depth;
-			}
-		}
+		super(Infinity);
 	}
 
 	show(): string {
 		return this.intersectionParts.map(type => type.show()).join(" | ");
 	}
 }
-export class ObjectType extends TypeBase {
-	size: number;
 
+export const defaultMaxDepth = 20;
+export class ObjectType extends TypeBase {
 	// We do not have optional properties, but we type them as T | undefined instead.
-	constructor(public members: Map<PropertyName, Type>, public extendsType?: ObjectType, public name?: string, public instantiatedTypeParameters: Type[] = [], public typeParameters: TypeParameter[] = []) {
-		super();
-		for (const member of members.values()) {
-			if (member.depth >= this.depth) {
-				this.depth = member.depth + 1;
-			}
-		}
-		this.size = members.size;
-		if (extendsType !== undefined) {
-			this.size += extendsType.size;
-		}
+	constructor(public members: Map<PropertyName, Type>, public extendsType?: ObjectType, public name?: string, public instantiatedTypeParameters: Type[] = [], public typeParameters: TypeParameter[] = [], depth = defaultMaxDepth) {
+		super(depth);
 	}
 
 	show() {
@@ -154,7 +136,7 @@ export class ObjectType extends TypeBase {
 					output += `[${ key.name }: ${ primitiveForIndexer(key).show() }]`;
 				}
 				output += ": ";
-				output += value.show();
+				output += limitFor(value, this).show();
 			}
 			current = current.extendsType;
 		}
@@ -163,7 +145,7 @@ export class ObjectType extends TypeBase {
 }
 export class LiteralType extends TypeBase {
 	constructor(public value: string | number | boolean) {
-		super();
+		super(Infinity);
 	}
 	
 	static create(value: string | number | boolean) {
@@ -190,7 +172,7 @@ export class TypeParameter extends TypeBase {
 		public name: string,
 		original?: TypeParameter
 	) {
-		super();
+		super(Infinity);
 		if (original === undefined) {
 			this.original = this;
 		} else {
@@ -199,7 +181,6 @@ export class TypeParameter extends TypeBase {
 		if (base === undefined) {
 			base = primitiveAny;
 		}
-		this.depth = base.depth;
 	}
 	
 	show() {
@@ -213,8 +194,7 @@ export class FunctionReference extends TypeBase {
 		public declaration: ts.FunctionLikeDeclaration,
 		public signature: FunctionSignature
 	) {
-		super();
-		this.depth = this.signature.depth;
+		super(Infinity);
 	}
 
 	show() {
@@ -242,15 +222,10 @@ export class FunctionSignature extends TypeBase {
 		public thisType: Type,
 		public typeParameters: TypeParameter[],
 		public args: FunctionArgument[],
-		public returnType: Type
+		public returnType: Type,
+		depth = defaultMaxDepth
 	) {
-		super();
-		this.depth = Math.max(
-			thisType.depth,
-			returnType.depth,
-			...typeParameters.map(t => t.depth),
-			...args.map(arg => arg.type.depth)
-		);
+		super(depth);
 	}
 
 	show(): string {
@@ -281,7 +256,7 @@ export class LazyType<T extends ResolvedType> extends TypeBase {
 	private resolveType: () => T | LazyType<T>;
 
 	constructor(resolve: () => T | LazyType<T>) {
-		super();
+		super(Infinity);
 
 		this.resolveType = resolve;
 	}
@@ -300,6 +275,35 @@ export class LazyType<T extends ResolvedType> extends TypeBase {
 	show() {
 		return this.resolve().show();
 	}
+}
+
+export function limitDepth<T extends Type>(type: T, depth: number): T
+export function limitDepth(type: Type, depth: number): Type {
+	if (depth <= 0) return primitiveAny;
+	if (type instanceof ObjectType) {
+		if (type.maxDepth <= depth) return type;
+		return new ObjectType(type.members, type.extendsType, type.name, type.instantiatedTypeParameters, type.typeParameters, depth);
+	}
+	if (type instanceof FunctionSignature) {
+		if (type.maxDepth <= depth) return type;
+		return new FunctionSignature(type.isConstructor, type.thisType, type.typeParameters, type.args, type.returnType, depth);
+	}
+	if (type instanceof LazyType) {
+		return new LazyType(() => limitDepth(type.resolve(), depth));
+	}
+	if (type instanceof UnionType) {
+		return new UnionType(type.unionParts.map(t => limitDepth(t, depth)));
+	}
+	if (type instanceof IntersectionType) {
+		return new IntersectionType(type.intersectionParts.map(t => limitDepth(t, depth)));
+	}
+	if (type instanceof TypeParameter) {
+		return new TypeParameter(limitDepth(type.base, depth), type.name, type.original);
+	}
+	return type;
+}
+export function limitFor<T extends Type>(type: T, parent: Type) {
+	return limitDepth(type, parent.maxDepth - 1);
 }
 
 export const primitiveNever = new UnionType([]);
@@ -359,7 +363,7 @@ export function isSubtype(host: TypeHost, s: Type, t: Type): boolean {
 		return isSubtype(host, s.base, t);
 	}
 	if (t instanceof ObjectType) {
-		for (const [property, tPropertyType] of properties(t)) {
+		for (const [property, tPropertyType] of properties(host, t)) {
 			const sPropertyType = propertyType(host, s, property) || primitiveUndefined;
 			if (!isSubtype(host, sPropertyType, tPropertyType)) return false;
 		}
@@ -372,7 +376,7 @@ export function isSubtype(host: TypeHost, s: Type, t: Type): boolean {
 	}
 	if (s instanceof FunctionSignature && t instanceof FunctionSignature) {
 		if (s.isConstructor !== t.isConstructor) return false;
-		if (!isSubtype(host, s.returnType, t.returnType)) return false;
+		if (!isSubtype(host, limitFor(s.returnType, s), limitFor(t.returnType, t))) return false;
 		if (s.args.length !== t.args.length) return false;
 		for (let i = 0; i < s.args.length; i++) {
 			const sArg = s.args[i];
@@ -383,7 +387,7 @@ export function isSubtype(host: TypeHost, s: Type, t: Type): boolean {
 				return false;
 			}
 			if (sArg.rest !== tArg.rest) return false;
-			if (!isSubtype(host, tArg.type, sArg.type)) return false;
+			if (!isSubtype(host, limitFor(tArg.type, t), limitFor(sArg.type, s))) return false;
 		}
 		return true;
 	}
@@ -537,11 +541,6 @@ function widenLiterals(type: Type) {
 	}
 	return type;
 }
-export function widenObject(type: ObjectType): Type {
-	if (type.depth >= 30) return primitiveAny;
-	if (type.size >= 20) return primitiveAny;
-	return type;
-}
 
 export function toNumber(host: TypeHost, type: Type) {
 	return typeLiteralMap(host, type, primitiveNumber, value => +value);
@@ -656,14 +655,18 @@ export function indexerForPropertyName(name: PropertyName) {
 	}
 	return undefined;
 }
-export function* properties(type: ObjectType): IterableIterator<[PropertyName, Type]> {
+export function* properties(host: TypeHost, type: ObjectType): IterableIterator<[PropertyName, Type]> {
 	let current: ObjectType | undefined = type;
 	const seen = new Set<PropertyName>();
 	while (current !== undefined) {
-		for (const [property, propertyType] of current.members) {
+		for (const [property] of current.members) {
 			if (!seen.has(property)) {
+				const propType = propertyType(host, current, property);
+				if (propType === undefined) {
+					throw new Error("Debug failure. Expected a type, got propType = undefined");
+				}
 				seen.add(property);
-				yield [property, propertyType];
+				yield [property, propType];
 			}
 		}
 		current = current.extendsType;
@@ -706,7 +709,9 @@ export function propertyType(host: TypeHost, type: Type, propertyName: PropertyN
 	}
 
 	const propType = getProperty(type, propertyName);
-	if (propType !== undefined) return propType;
+	if (propType !== undefined) {
+		return limitFor(propType, type);
+	}
 
 	const indexer = indexerForPropertyName(propertyName);
 	if (indexer !== undefined) {
@@ -714,7 +719,9 @@ export function propertyType(host: TypeHost, type: Type, propertyName: PropertyN
 		if (indexerType === undefined && indexer.kind === IndexerKind.Number) {
 			indexerType = getProperty(type, indexerString);
 		}
-		if (indexerType !== undefined) return union(host, [indexerType, primitiveUndefined]);
+		if (indexerType !== undefined) {
+			return limitFor(union(host, [indexerType, primitiveUndefined]), type);
+		}
 	}
 
 	// Unknown property
@@ -1041,8 +1048,8 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 	const argumentMapping: [number, CallArgument[]][] = [];
 
 	let i = 0;
-	for (let j = 0; j < args.length; j++) {
-		const arg = args[j];
+	for (; i < args.length; i++) {
+		const arg = args[i];
 		const functionArg = signature.args[i];
 		if (functionArg === undefined) {
 			// Too many arguments
@@ -1053,7 +1060,8 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 			return undefined;
 		}
 		if (functionArg.rest) {
-			argumentMapping.push([i, args.slice(j)]);
+			argumentMapping.push([i, args.slice(i)]);
+			i = signature.args.length;
 			break;
 		}
 		argumentMapping.push([i, [arg]]);
@@ -1080,8 +1088,9 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 		}
 		for (const [i, callArgs] of argumentMapping) {
 			const functionArg = signature.args[i];
-			const functionArgType = functionArg.rest ? propertyType(host, functionArg.type, indexerNumber) : functionArg.type;
+			let functionArgType = functionArg.rest ? propertyType(host, functionArg.type, indexerNumber) : functionArg.type;
 			if (functionArgType === undefined) return undefined;
+			functionArgType = limitFor(functionArgType, signature);
 			for (const arg of callArgs) {
 				const argType = arg.spread ? propertyType(host, arg.type, indexerNumber) : arg.type;
 				if (argType === undefined) return undefined;
@@ -1089,7 +1098,7 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 			}
 		}
 
-		if (!assign(thisType, signature.thisType, false)) return undefined;
+		if (!assign(thisType, limitFor(signature.thisType, signature), false)) return undefined;
 
 		for (const param of signature.typeParameters) {
 			const upper = union(host, substituteUpper.get(param)!);
@@ -1110,7 +1119,8 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 				arg.optional,
 				arg.rest
 			)),
-			substituteType(signature.returnType)
+			substituteType(signature.returnType),
+			signature.maxDepth
 		);
 	}
 
@@ -1126,6 +1136,9 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 	}
 	return signature;
 
+	function assignLimit(to: Type, toParent: Type, type: Type, typeParent: Type, contra: boolean) {
+		return assign(limitFor(to, toParent), limitFor(type, typeParent), contra);
+	}
 	function assign(to: Type, type: Type, contra: boolean): boolean {
 		if (to === type) return true;
 		to = resolve(to);
@@ -1163,14 +1176,14 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 				return false;
 			}
 			for (let i = 0; i < to.args.length; i++) {
-				const toArg = to.args[i];
-				const arg = type.args[i];
+				const toArg: FunctionArgument = to.args[i];
+				const arg: FunctionArgument = type.args[i];
 				if (arg === undefined) break;
 				if (toArg.rest !== arg.rest) return false;
 				if (toArg.optional && !arg.optional) return false;
-				if (!assign(toArg.type, arg.type, !contra)) return false;
+				if (!assignLimit(toArg.type, to, arg.type, type, !contra)) return false;
 			}
-			return assign(to.thisType, type.thisType, contra) && assign(to.returnType, type.returnType, contra);
+			return assignLimit(to.thisType, to, type.thisType, type, contra) && assignLimit(to.returnType, to, type.returnType, type, contra);
 		}
 		// Union type
 		const saveSubstituteUpper = new Map(substituteUpper);
