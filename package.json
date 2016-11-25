@@ -7,7 +7,8 @@
     "build": "tsc -p src",
     "test": "ava dist/test",
     "demo": "node dist/lib/demo",
-    "runner": "node dist/lib/runner"
+    "runner": "node --max_old_space_size=4096 dist/lib/runner",
+    "all-cases": "npm run runner -- --case=timeago --outFile=cases/output/timeago.js && npm run runner -- --case=mustache --outFile=cases/output/mustache.js"
   },
   "author": "Ivo Gabe de Wolff",
   "license": "MIT",

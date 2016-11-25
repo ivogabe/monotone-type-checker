@@ -6,7 +6,7 @@ import * as instance from "./instance";
 const args = process.argv.slice(2);
 
 if (args.length === 0) {
-	console.log('Usage: npm run runner -- filenames [--case=timeago|mustache] [--time]');
+	console.log('Usage: npm run runner -- filenames [--case=timeago|mustache] [--time] [--outFile=filename]');
 	process.exit();
 }
 
@@ -39,7 +39,12 @@ const result = monotone.runFiles(instance.typeChecker(), true, files);
 const timeAnalysis = process.hrtime(timeAnalysisStart);
 const timeTotal = process.hrtime(timeStart);
 
-console.log(result.types.join("\n"));
+const outFile = readOption("outFile");
+if (outFile === undefined) {
+	console.log(result.types.join("\n"));
+} else {
+	fs.writeFileSync(outFile, result.types.join("\n"))
+}
 
 if (hasOption('time')) {
 	const printTime = (title: string, [seconds, nanoseconds]: number[]) => {
@@ -52,8 +57,18 @@ if (hasOption('time')) {
 	printTime("Total", timeTotal);
 }
 
+console.log("Fraction any", Math.round(result.fractionAny * 100) + "%");
+console.log("Fraction TS any", Math.round(result.getFractionTSAny() * 100) + "%");
+
 function hasOption(option: string) {
 	return options.indexOf(option) !== -1;
+}
+function readOption(option: string) {
+	for (const item of options) {
+		if (item.substring(0, option.length + 1) === option + "=") {
+			return item.substring(option.length + 1);
+		}
+	}
 }
 function addWhitespaceRight(length: number, str: string): string {
 	if (str.length < length) return addWhitespaceRight(length, str + " ");

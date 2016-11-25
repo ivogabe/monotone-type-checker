@@ -13,6 +13,7 @@ export interface TypeHost {
 	globalNumber: LazyType<ObjectType>;
 	globalString: LazyType<ObjectType>;
 	globalBoolean: LazyType<ObjectType>;
+	globalRegExp: LazyType<ObjectType>;
 	globalFunction: LazyType<ObjectType>;
 }
 
@@ -39,7 +40,9 @@ export function primitiveForIndexer(indexer: Indexer) {
 }
 
 export abstract class TypeBase {
-	abstract show(): string;
+	abstract show(reference?: boolean): string;
+
+	limitted: { [depth: number]: Type } = {};
 
 	constructor(public maxDepth: number) {}
 }
@@ -61,7 +64,7 @@ export class PrimitiveType extends TypeBase {
 		super(Infinity);
 	}
 
-	show() {
+	show(_reference?: boolean) {
 		switch (this.kind) {
 			case PrimitiveKind.Void:
 				return "void";
@@ -86,7 +89,7 @@ export class EnumType extends TypeBase {
 	name: string;
 	members: [string, number][];
 	
-	show() {
+	show(_reference?: boolean) {
 		return this.name;
 	}
 }
@@ -95,9 +98,9 @@ export class UnionType extends TypeBase {
 		super(Infinity);
 	}
 
-	show(): string {
+	show(reference?: boolean): string {
 		if (this.unionParts.length === 0) return "never";
-		return this.unionParts.map(type => type.show()).join(" | ");
+		return this.unionParts.map(type => type.show(reference)).join(" | ");
 	}
 }
 export class IntersectionType extends TypeBase {
@@ -105,19 +108,40 @@ export class IntersectionType extends TypeBase {
 		super(Infinity);
 	}
 
-	show(): string {
-		return this.intersectionParts.map(type => type.show()).join(" | ");
+	show(reference?: boolean): string {
+		return this.intersectionParts.map(type => type.show(reference)).join(" & ");
 	}
 }
 
 export const defaultMaxDepth = 20;
 export class ObjectType extends TypeBase {
+	memberCount: number | undefined = undefined;
+
 	// We do not have optional properties, but we type them as T | undefined instead.
 	constructor(public members: Map<PropertyName, Type>, public extendsType?: ObjectType, public name?: string, public instantiatedTypeParameters: Type[] = [], public typeParameters: TypeParameter[] = [], depth = defaultMaxDepth) {
 		super(depth);
 	}
 
-	show() {
+	show(reference = false) {
+		if (reference && this.name !== undefined) {
+			let output = this.name;
+			if (this.instantiatedTypeParameters.length !== 0 || this.typeParameters.length !== 0) {
+				output += '<';
+				let first = false;
+				for (const param of this.instantiatedTypeParameters) {
+					if (!first) output += ", ";
+					first = false;
+					output += param.show(true);
+				}
+				for (const param of this.typeParameters) {
+					if (!first) output += ", ";
+					first = false;
+					output += param.show(true);
+				}
+				output += '>';
+			}
+			return output;
+		}
 		let output = "{ ";
 		let first = true;
 		let current: ObjectType | undefined = this;
@@ -133,10 +157,10 @@ export class ObjectType extends TypeBase {
 				} else if (typeof key === "number") {
 					output += key;
 				} else if (key instanceof Indexer) {
-					output += `[${ key.name }: ${ primitiveForIndexer(key).show() }]`;
+					output += `[${ key.name }: ${ primitiveForIndexer(key).show(true) }]`;
 				}
 				output += ": ";
-				output += limitFor(value, this).show();
+				output += limitFor(value, this).show(true);
 			}
 			current = current.extendsType;
 		}
@@ -157,7 +181,7 @@ export class LiteralType extends TypeBase {
 		return new LiteralType(value);
 	}
 	
-	show() {
+	show(_reference?: boolean) {
 		if (typeof this.value === "number") return this.value.toString();
 		return JSON.stringify(this.value);
 	}
@@ -181,9 +205,10 @@ export class TypeParameter extends TypeBase {
 		if (base === undefined) {
 			base = primitiveAny;
 		}
+		this.base = base;
 	}
 	
-	show() {
+	show(_reference?: boolean) {
 		return this.name;
 	}
 }
@@ -197,7 +222,7 @@ export class FunctionReference extends TypeBase {
 		super(Infinity);
 	}
 
-	show() {
+	show(reference?: boolean) {
 		let name: string;
 		if (this.declaration.name) {
 			switch (this.declaration.name.kind) {
@@ -213,7 +238,7 @@ export class FunctionReference extends TypeBase {
 		} else {
 			name = "(unnamed)";
 		}
-		return name + "~" + this.signature.show();
+		return name + "~" + this.signature.show(reference);
 	}
 }
 export class FunctionSignature extends TypeBase {
@@ -228,8 +253,8 @@ export class FunctionSignature extends TypeBase {
 		super(depth);
 	}
 
-	show(): string {
-		return `${ this.isConstructor ? "new " : "" }(${ this.args.map(arg => arg.show()).join(", ") }) => ${ this.returnType.show() }`;
+	show(_reference?: boolean): string {
+		return `${ this.isConstructor ? "new " : "" }(${ this.args.map(arg => arg.show(this, true)).join(", ") }) => ${ limitFor(this.returnType, this).show(true) }`;
 	}
 }
 export class FunctionArgument {
@@ -240,7 +265,7 @@ export class FunctionArgument {
 		public rest: boolean
 	) {}
 
-	show() {
+	show(parent: FunctionSignature, reference?: boolean) {
 		let result = this.name;
 		if (this.optional) {
 			result += "?";
@@ -248,7 +273,7 @@ export class FunctionArgument {
 		if (this.rest) {
 			result = "..." + result;
 		}
-		return result + ": " + this.type.show();
+		return result + ": " + limitFor(this.type, parent).show(reference);
 	}
 }
 export class LazyType<T extends ResolvedType> extends TypeBase {
@@ -272,38 +297,60 @@ export class LazyType<T extends ResolvedType> extends TypeBase {
 		return this.resolved;
 	}
 
-	show() {
-		return this.resolve().show();
+	show(reference?: boolean) {
+		return this.resolve().show(reference);
 	}
 }
 
 export function limitDepth<T extends Type>(type: T, depth: number): T
 export function limitDepth(type: Type, depth: number): Type {
 	if (depth <= 0) return primitiveAny;
+	if (type.maxDepth <= depth) return type;
+	if (type.limitted[depth] !== undefined) {
+		return type.limitted[depth];
+	}
+	let result: Type;
 	if (type instanceof ObjectType) {
-		if (type.maxDepth <= depth) return type;
-		return new ObjectType(type.members, type.extendsType, type.name, type.instantiatedTypeParameters, type.typeParameters, depth);
+		result = new ObjectType(type.members, type.extendsType, type.name, type.instantiatedTypeParameters, type.typeParameters, depth);
+	} else if (type instanceof FunctionSignature) {
+		result = new FunctionSignature(type.isConstructor, type.thisType, type.typeParameters, type.args, type.returnType, depth);
+	} else if (type instanceof LazyType) {
+		result = new LazyType(() => limitDepth(type.resolve(), depth - 1));
+	} else if (type instanceof UnionType) {
+		result = new UnionType(type.unionParts.map(t => limitDepth(t, depth)));
+	} else if (type instanceof IntersectionType) {
+		result = new IntersectionType(type.intersectionParts.map(t => limitDepth(t, depth)));
+	} else if (type instanceof TypeParameter) {
+		result = new TypeParameter(limitDepth(type.base, depth), type.name, type.original);
+	} else {
+		return type;
 	}
-	if (type instanceof FunctionSignature) {
-		if (type.maxDepth <= depth) return type;
-		return new FunctionSignature(type.isConstructor, type.thisType, type.typeParameters, type.args, type.returnType, depth);
-	}
-	if (type instanceof LazyType) {
-		return new LazyType(() => limitDepth(type.resolve(), depth));
-	}
-	if (type instanceof UnionType) {
-		return new UnionType(type.unionParts.map(t => limitDepth(t, depth)));
-	}
-	if (type instanceof IntersectionType) {
-		return new IntersectionType(type.intersectionParts.map(t => limitDepth(t, depth)));
-	}
-	if (type instanceof TypeParameter) {
-		return new TypeParameter(limitDepth(type.base, depth), type.name, type.original);
-	}
-	return type;
+	result.limitted = type.limitted;
+	type.limitted[depth] = result;
+	return result;
 }
 export function limitFor<T extends Type>(type: T, parent: Type) {
 	return limitDepth(type, parent.maxDepth - 1);
+}
+const maxProperties = 40;
+export function widenObject(type: ObjectType) {
+	if (type.memberCount !== 0) {
+		return type.memberCount > maxProperties ? primitiveAny : type;
+	}
+
+	const props = new Set<PropertyName>();
+	let current: ObjectType | undefined = type;
+	while (current !== undefined) {
+		for (const member of current.members.keys()) {
+			props.add(member);
+			if (props.size > maxProperties) {
+				type.memberCount = Infinity;
+				return primitiveAny;
+			}
+		}
+	}
+	type.memberCount = props.size;
+	return type;
 }
 
 export const primitiveNever = new UnionType([]);
@@ -331,6 +378,11 @@ export function typesEqual(host: TypeHost, s: Type, t: Type) {
 	return isSubtype(host, s, t) && isSubtype(host, t, s);
 }
 export function isSubtype(host: TypeHost, s: Type, t: Type): boolean {
+	if (s === t) return true;
+
+	s = resolve(s);
+	t = resolve(t);
+
 	if (s === t) return true;
 	
 	if (s === primitiveNever) return true;
@@ -456,8 +508,11 @@ export function intersect(host: TypeHost, xs: Iterable<Type>): Type {
 		}
 	}
 
+	if (nonUnionParts.length === 0 && otherParts.length === 0) {
+		return primitiveAny;
+	}
 	return union(host, create(nonUnionParts, 0).map(parts => {
-		if (parts.length === 0) return primitiveNever;
+		if (parts.length === 0) return primitiveAny;
 		if (parts.length === 1) return parts[0];
 		return new IntersectionType(parts);
 	}));
@@ -738,54 +793,65 @@ export function propertyType(host: TypeHost, type: Type, propertyName: PropertyN
 }
 
 export function mapType(host: TypeHost, type: Type, callback: (t: Type) => Type | undefined) {
-	return map(type);
+	return mapDepth(type, type.maxDepth);
 
-	function mapObjectType(t: ObjectType) {
+	function mapObjectType(t: ObjectType, depth: number) {
 		let extendsType: Type | undefined = undefined;
 		if (t.extendsType) {
-			extendsType = map(t.extendsType);
+			extendsType = mapDepth(t.extendsType, depth - 1);
 			if (!(extendsType instanceof ObjectType)) {
 				throw new Error("mapType: extendsType of object should be mapped to an ObjectType");
 			}
 		}
 		return new ObjectType(
-			mapMap(t.members, map),
+			mapMap(t.members, map(depth - 1)),
 			extendsType,
 			t.name,
-			t.instantiatedTypeParameters.map(map),
-			t.typeParameters.map(mapTypeParameter)
+			t.instantiatedTypeParameters.map(map(depth - 1)),
+			t.typeParameters.map(mapTypeParameter),
+			t.maxDepth
 		);
 	}
-	function map(type: Type): Type {
+	function map(depth: number) {
+		return (type: Type) => mapDepth(type, depth);
+	}
+	function mapDepth(type: Type, depth: number): Type {
+		if (depth <= 0) return primitiveAny;
+
 		const mapped = callback(type);
-		if (mapped !== undefined) return mapped;
+		if (mapped !== undefined) return limitDepth(mapped, type.maxDepth);
+
+		if (type.maxDepth < depth) {
+			depth = type.maxDepth;
+		}
 
 		if (type instanceof ObjectType) {
-			return mapObjectType(type);
+			return mapObjectType(type, depth);
 		} else if (type instanceof PrimitiveType || type instanceof EnumType || type instanceof LiteralType || type instanceof FunctionReference) {
 			return type;
 		} else if (type instanceof UnionType) {
-			return mapUnion(host, type, map);
+			return mapUnion(host, type, map(depth));
 		} else if (type instanceof IntersectionType) {
-			return intersect(host, intersectionParts(type).map(map));
+			return intersect(host, intersectionParts(type).map(map(depth)));
 		} else if (type instanceof TypeParameter) {
-			return mapTypeParameter(type);
+			return mapTypeParameter(type, depth);
 		} else if (type instanceof LazyType) {
-			return new LazyType(() => map(type.resolve()));
+			return new LazyType(() => mapDepth(type.resolve(), depth - 1));
 		} else {
-			return new FunctionSignature(type.isConstructor, map(type.thisType), type.typeParameters.map(mapTypeParameter) as TypeParameter[], type.args.map(mapFunctionArgument), map(type.returnType));
+			return new FunctionSignature(type.isConstructor, mapDepth(type.thisType, depth - 1), type.typeParameters.map(arg => mapTypeParameter(arg, depth - 1)) as TypeParameter[], type.args.map(arg => mapFunctionArgument(arg, depth - 1)), mapDepth(type.returnType, depth - 1), depth);
 		}
 	}
-	function mapFunctionArgument(argument: FunctionArgument) {
-		return new FunctionArgument(argument.name, map(argument.type), argument.optional, argument.rest);
+	function mapFunctionArgument(argument: FunctionArgument, depth: number) {
+		return new FunctionArgument(argument.name, mapDepth(argument.type, depth), argument.optional, argument.rest);
 	}
-	function mapTypeParameter(param: TypeParameter) {
+	function mapTypeParameter(param: TypeParameter, depth: number) {
 		if (param.base === undefined) return param;
-		return new TypeParameter(map(param.base), param.name, param.original);
+		return new TypeParameter(mapDepth(param.base, depth), param.name, param.original);
 	}
 }
 export type InstantiationCache = WeakMap<ObjectType, WeakMap<Type, ObjectType>>;
 export function instantiateObject(host: TypeHost, type: ObjectType, parameterType: Type) {
+	// if (1) return type; // TODO!!!!
 	if (type.typeParameters.length === 0) {
 		console.log("Cannot instantiate an object type without type parameters");
 		return type;
@@ -874,12 +940,12 @@ export function propertyNamesForType(type: Type): PropertyName[] | undefined {
 	return undefined;
 }
 
-export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDeclaration, typeParameters: TypeParameter[] = []): Type {
-	return from(n);
+export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDeclaration | ts.TypeElement, typeParameters: TypeParameter[] = [], depth = defaultMaxDepth): Type {
+	return from(n, depth);
 
-	function from(node: ts.TypeNode | ts.FunctionLikeDeclaration): Type;
-	function from(node: ts.TypeNode | ts.FunctionLikeDeclaration | undefined): Type | undefined;
-	function from(node: ts.TypeNode | ts.FunctionLikeDeclaration | undefined): any {
+	function from(node: ts.TypeNode | ts.FunctionLikeDeclaration | ts.TypeElement, depth: number): Type;
+	function from(node: ts.TypeNode | ts.FunctionLikeDeclaration | ts.TypeElement | undefined, depth: number): Type | undefined;
+	function from(node: ts.TypeNode | ts.FunctionLikeDeclaration | ts.TypeElement | undefined, depth: number): any {
 		if (node === undefined) return undefined;
 		switch (node.kind) {
 			case ts.SyntaxKind.FunctionType:
@@ -892,7 +958,10 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 			case ts.SyntaxKind.SetAccessor:
 			case ts.SyntaxKind.FunctionExpression:
 			case ts.SyntaxKind.Constructor:
-				return fromFunctionOrConstructorType(node as ts.FunctionOrConstructorTypeNode | ts.FunctionLikeDeclaration);
+			case ts.SyntaxKind.MethodSignature:
+			case ts.SyntaxKind.CallSignature:
+			case ts.SyntaxKind.ConstructSignature:
+				return fromFunctionOrConstructorType(node as ts.FunctionOrConstructorTypeNode | ts.FunctionLikeDeclaration | ts.MethodSignature | ts.CallSignatureDeclaration | ts.ConstructSignatureDeclaration, depth);
 			case ts.SyntaxKind.StringKeyword:
 				return primitiveString;
 			case ts.SyntaxKind.NumberKeyword:
@@ -910,17 +979,17 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 			case ts.SyntaxKind.VoidKeyword:
 				return primitiveVoid;
 			case ts.SyntaxKind.ArrayType:
-				return fromArrayType(node as ts.ArrayTypeNode);
+				return fromArrayType(node as ts.ArrayTypeNode, depth);
 			case ts.SyntaxKind.ParenthesizedType:
-				return from((node as ts.ParenthesizedTypeNode).type);
+				return from((node as ts.ParenthesizedTypeNode).type, depth);
 			case ts.SyntaxKind.UnionType:
-				return fromUnionType(node as ts.UnionTypeNode);
+				return fromUnionType(node as ts.UnionTypeNode, depth);
 			case ts.SyntaxKind.IntersectionType:
-				return fromIntersectionType(node as ts.IntersectionTypeNode);
+				return fromIntersectionType(node as ts.IntersectionTypeNode, depth);
 			case ts.SyntaxKind.LiteralType:
 				return fromLiteralType(node as ts.LiteralTypeNode);
 			case ts.SyntaxKind.TypeReference:
-				return fromTypeReference(node as ts.TypeReferenceNode);
+				return fromTypeReference(node as ts.TypeReferenceNode, depth);
 			default:
 				// console.log("Unexpected type node kind: " + ts.SyntaxKind[node.kind]);
 				return primitiveAny;
@@ -938,52 +1007,48 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 				return literalFalse;
 		}
 	}
-	function fromFunctionOrConstructorType(node: ts.FunctionOrConstructorTypeNode | ts.FunctionLikeDeclaration) {
+	function fromFunctionOrConstructorType(node: ts.FunctionOrConstructorTypeNode | ts.FunctionLikeDeclaration | ts.MethodSignature | ts.CallSignatureDeclaration | ts.ConstructSignatureDeclaration, depth: number) {
 		const saveTypeParameters = typeParameters;
 
-		const funcTypeParameters = !node.typeParameters ? [] : node.typeParameters.map(fromTypeParameterDeclaration);
+		const funcTypeParameters = !node.typeParameters ? [] : node.typeParameters.map(node => fromTypeParameterDeclaration(node, depth - 1));
 
 		typeParameters = [...funcTypeParameters, ...typeParameters];
 
-		let funcArguments = node.parameters.map(fromParameterDeclaration);
+		let funcArguments = node.parameters.map((param, index) => fromParameterDeclaration(param, index, depth - 1));
 		let thisType: Type = primitiveAny;
 		if (funcArguments.length > 0 && funcArguments[0].name === "this") {
 			thisType = funcArguments[0].type;
 			funcArguments = funcArguments.slice(1);
 		}
-		const isConstructor = node.kind === ts.SyntaxKind.Constructor || node.kind === ts.SyntaxKind.ConstructorType;
-		const returnType = from(node.type) || primitiveAny;
+		const isConstructor = node.kind === ts.SyntaxKind.Constructor || node.kind === ts.SyntaxKind.ConstructorType || node.kind === ts.SyntaxKind.ConstructSignature;
+		const returnType = new LazyType(() => from(node.type, depth - 1) || primitiveAny);
 
 		typeParameters = saveTypeParameters;
 
 		return new FunctionSignature(isConstructor, thisType, funcTypeParameters, funcArguments, returnType);
 	}
-	function fromArrayType(node: ts.ArrayTypeNode) {
-		return instantiateObject(host, host.globalArray.resolve(), from(node.elementType));
+	function fromArrayType(node: ts.ArrayTypeNode, depth: number) {
+		return instantiateObject(host, host.globalArray.resolve(), from(node.elementType, depth - 1));
 	}
 	
-	function fromTypeParameterDeclaration(node: ts.TypeParameterDeclaration) {
+	function fromTypeParameterDeclaration(node: ts.TypeParameterDeclaration, depth: number) {
 		return new TypeParameter(
-			from(node.constraint),
+			from(node.constraint, depth),
 			node.name.text
 		);
 	}
-	function fromParameterDeclaration(node: ts.ParameterDeclaration, index: number) {
+	function fromParameterDeclaration(node: ts.ParameterDeclaration, index: number, depth: number) {
 		const name = node.name.kind === ts.SyntaxKind.Identifier ? (node.name as ts.Identifier).text : "_" + index;
-		const type = from(node.type) || primitiveAny;
+		const type = new LazyType(() => from(node.type, depth) || primitiveAny);
 		return new FunctionArgument(name, type, node.questionToken !== undefined, node.dotDotDotToken !== undefined);
 	}
-	function fromUnionType(node: ts.UnionTypeNode) {
-		// Lambda is not required here, but TypeScript
-		// gives a type error if omitted.
-		return union(host, node.types.map(t => from(t)));
+	function fromUnionType(node: ts.UnionTypeNode, depth: number) {
+		return union(host, node.types.map(t => from(t, depth)));
 	}
-	function fromIntersectionType(node: ts.IntersectionTypeNode) {
-		// Lambda is not required here, but TypeScript
-		// gives a type error if omitted.
-		return intersect(host, node.types.map(t => from(t)));
+	function fromIntersectionType(node: ts.IntersectionTypeNode, depth: number) {
+		return intersect(host, node.types.map(t => from(t, depth)));
 	}
-	function fromTypeReference(node: ts.TypeReferenceNode) {
+	function fromTypeReference(node: ts.TypeReferenceNode, depth: number) {
 		const name = entityNameToString(node.typeName);
 		let type = resolve(host.rootType(name));
 		if (type === undefined) {
@@ -1000,7 +1065,7 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 		if (node.typeArguments) {
 			if (type instanceof ObjectType) {
 				for (const arg of node.typeArguments) {
-					type = instantiateObject(host, type, from(arg));
+					type = instantiateObject(host, type, from(arg, depth - 1));
 				}
 			} else {
 				console.log("Can only use type arguments with object types");
@@ -1009,7 +1074,7 @@ export function fromTsType(host: TypeHost, n: ts.TypeNode | ts.FunctionLikeDecla
 		return type;
 	}
 }
-export function fromTsIndexer(host: TypeHost, node: ts.IndexSignatureDeclaration): PropertyName {
+export function fromTsIndexer(host: TypeHost, node: ts.IndexSignatureDeclaration, typeParameters: TypeParameter[], depth: number): PropertyName {
 	if (node.parameters.length !== 1) {
 		console.log("Invalid index signature");
 	}
@@ -1017,8 +1082,7 @@ export function fromTsIndexer(host: TypeHost, node: ts.IndexSignatureDeclaration
 	if (typeNode === undefined) {
 		return indexerString;
 	}
-	const type = fromTsType(host, typeNode);
-	
+	const type = fromTsType(host, typeNode, typeParameters, depth);
 	
 	if (type instanceof LiteralType) {
 		if (typeof type.value === "number" || typeof type.value === "string") {
@@ -1046,7 +1110,7 @@ export interface CallArgument {
 }
 export function functionSignatureMatches(host: TypeHost, signature: FunctionSignature, thisType: Type, args: CallArgument[]) {
 	const argumentMapping: [number, CallArgument[]][] = [];
-
+	
 	let i = 0;
 	for (; i < args.length; i++) {
 		const arg = args[i];
@@ -1208,6 +1272,34 @@ export function functionSignatureMatches(host: TypeHost, signature: FunctionSign
 	function substituteType(type: Type) {
 		return mapType(host, type, t => t instanceof TypeParameter ? substitutes.get(t) : undefined);
 	}
+}
+
+export function intersectObjects(host: TypeHost, objects: Iterable<ObjectType>) {
+	let result = new ObjectType(new Map());
+	for (const object of objects) {
+		result = extendObject(host, object, result, false);
+	}
+	return result;
+}
+export function extendObject(host: TypeHost, object: ObjectType, base: ObjectType, override: boolean) {
+	const members = new Map(base.members.entries());
+	for (const [name, type] of members) {
+		const limited = limitFor(type, base);
+		if (limited !== type) {
+			members.set(name, limited);
+		}
+	}
+
+	for (let [name, type] of object.members) {
+		const baseType = members.get(name);
+		type = limitFor(type, object);
+		if (baseType === undefined || override) {
+			members.set(name, type);
+		} else {
+			members.set(name, intersect(host, [type, limitFor(baseType, base)]));
+		}
+	}
+	return new ObjectType(members, object.extendsType, undefined, object.instantiatedTypeParameters, object.typeParameters, Math.max(object.maxDepth, base.maxDepth));
 }
 
 export function binaryOperatorInverse(kind: ts.SyntaxKind) {

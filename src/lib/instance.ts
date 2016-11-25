@@ -7,6 +7,8 @@ import { curry, isFunctionLike, unreachable, identifierIsExpression } from "./ut
 export interface Output {
 	types: string[];
 	lastType: types.Type | undefined;
+	fractionAny: number;
+	getFractionTSAny: () => number;
 }
 
 interface Environment {
@@ -36,7 +38,8 @@ export function typeChecker(): Instance<Output> {
 	return monotone<Environment, Context, Output, ts.Node>((files, checker) => {
 		const scopeResolver = createScopeResolver(checker);
 
-		const rootTypes = new Map<string, types.Type>();
+		const rootTypes = new Map<string, types.Type | ((name: string) => types.Type)>();
+		const rootObjectTypes = new Map<string, (ts.ClassDeclaration | ts.InterfaceDeclaration)[]>();
 		for (const file of files) {
 			initRootTypes(file);
 		}
@@ -49,7 +52,13 @@ export function typeChecker(): Instance<Output> {
 			globalBoolean:  rootObjectType("Boolean"),
 			globalNumber:   rootObjectType("Number"),
 			globalString:   rootObjectType("String"),
-			globalFunction: rootObjectType("Function")
+			globalRegExp:   rootObjectType("RegExp"),
+			globalFunction: new types.LazyType(() => narrowProperty(
+				rootObjectType("Function"),
+				"prototype",
+				new types.ObjectType(new Map()),
+				true
+			) as types.ObjectType)
 		};
 
 		const typesEqual = curry(types.typesEqual, typeHost);
@@ -153,7 +162,7 @@ export function typeChecker(): Instance<Output> {
 			return true;
 		}
 		function entry(): Environment {
-			return bottomReachable; // initScope(node, bottomReachable);
+			return bottomReachable;
 		}
 		function join(a: Environment, b: Environment): Environment {
 			if (a.reachable && b.reachable) {
@@ -178,6 +187,9 @@ export function typeChecker(): Instance<Output> {
 			let lines: string[];
 			let currentLine: number;
 			
+			let count = 0;
+			let countAny = 0;
+
 			let f: ts.SourceFile;
 			for (f of files) {
 				if (f.isDeclarationFile) continue;
@@ -194,7 +206,9 @@ export function typeChecker(): Instance<Output> {
 
 			return {
 				types: result,
-				lastType
+				lastType,
+				fractionAny: countAny / count,
+				getFractionTSAny
 			};
 			
 			function visit(node: ts.Node) {
@@ -211,21 +225,50 @@ export function typeChecker(): Instance<Output> {
 					let countReachable = 0;
 					for (const context of contexts(node, GraphNodeKind.End)) {
 						const env = get(node, GraphNodeKind.End, context, true);
-						t.push(typeOf(node, env));
+						const type = typeOf(node, env);
+						t.push(type);
+						count++;
 						if (env.reachable) {
 							countReachable++;
+						}
+						if (type === types.primitiveAny) {
+							countAny++;
 						}
 					}
 
 					lastType = union(t);
-					output.push(">" + node.getText(f) + ": " + lastType.show() + "; " + countReachable + "/" + t.length);
+					if (t.length !== 0) {
+						output.push("//> " + node.getText(f) + ": " + lastType.show() + "; " + countReachable + "/" + t.length);
+					}
 				}
 			}
 			function shouldPrint(node: ts.Node) {
 				if (node.kind === ts.SyntaxKind.Identifier && identifierIsExpression(node as ts.Identifier)) return true;
-				if (node.kind === ts.SyntaxKind.CallExpression) return true;
+				if (node.kind === ts.SyntaxKind.ThisKeyword) return true;
 				if (node.kind === ts.SyntaxKind.PropertyAccessExpression) return true;
+				if (node.kind === ts.SyntaxKind.ElementAccessExpression) return true;
 				return false;
+			}
+			function getFractionTSAny() {
+				let countAny = 0;
+				let countTotal = 0;
+
+				for (const file of files) v(file);
+
+				return countAny / countTotal;
+
+				function v(node: ts.Node) {
+					if (shouldPrint(node)) {
+						for (const _context of contexts(node, GraphNodeKind.End)) {
+							countTotal++;
+							if (checker.getTypeAtLocation(node).flags & ts.TypeFlags.Any) {
+								countAny++;
+							}
+							break;
+						}
+					}
+					ts.forEachChild(node, v);
+				}
 			}
 		}
 
@@ -338,10 +381,13 @@ export function typeChecker(): Instance<Output> {
 
 		// Transfer functions
 		function transferIdentifierOrThisKeyword(node: ts.Node, env: Environment) {
+			if (node.kind === ts.SyntaxKind.ThisKeyword) {
+				return envSetNode(node, env.thisType, env);
+			}
+
 			const scopeId = scopeResolver.get(node);
 			if (scopeId === undefined) return env;
 			const type = storageSymbol.get(env.symbolTypes, scopeId);
-			if (type === types.primitiveNever) return env;
 			return envSetNode(node, type, env);
 		}
 		function transferUnaryExpression(node: ts.PrefixUnaryExpression | ts.PostfixUnaryExpression, env: Environment) {
@@ -378,7 +424,7 @@ export function typeChecker(): Instance<Output> {
 			const isNew = node.kind === ts.SyntaxKind.NewExpression;
 			let thisType: types.Type = types.primitiveUndefined;
 			if (isNew) {
-				thisType = propertyType(functionType, "prototype") || typeHost.globalObject;
+				thisType = propertyType(functionType, "prototype") || typeHost.globalObject.resolve();
 			} else if (node.parent!.kind === ts.SyntaxKind.PropertyAccessExpression || node.parent!.kind === ts.SyntaxKind.ElementAccessExpression) {
 				thisType = typeOf((node.parent! as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression, env);
 			}
@@ -398,16 +444,22 @@ export function typeChecker(): Instance<Output> {
 			});
 
 			for (const part of types.unionParts(functionType)) {
+				const partial: types.Type[] = [];
+				let hasReference = false;
 				for (const type of types.intersectionParts(part)) {
-					if (type instanceof types.FunctionSignature && type.isConstructor === isNew) {
+					if (type === types.primitiveAny) {
+						partial.push(types.primitiveAny);
+					} else if (type instanceof types.FunctionSignature && type.isConstructor === isNew) {
 						const match = functionSignatureMatches(type, thisType, args);
-						if (match) results.push(types.limitFor(match.returnType, match));
+						if (match) partial.push(types.limitFor(match.returnType, match));
 					} else if (type instanceof types.FunctionReference) {
 						let callEnv = envSetThisType(thisType, env);
 						let rest: ts.ParameterDeclaration | undefined;
 						for (let i = 0; i < node.arguments.length; i++) {
 							const argument = rest || type.declaration.parameters[i];
-							if (argument === undefined) break;
+							if (argument === undefined) {
+								break;
+							}
 							if (argument.dotDotDotToken) rest = argument;
 
 							callEnv = envSetSymbol(scopeResolver.get(argument.name), typeOf(node.arguments[i], env), callEnv);
@@ -418,7 +470,11 @@ export function typeChecker(): Instance<Output> {
 						}
 						const jumpContext = Context(node, context);
 						jumps.push(new Jump(type.declaration, jumpContext, callEnv));
+						hasReference = true;
 					}
+				}
+				if (!hasReference || partial.length !== 0) {
+					results.push(intersect(partial));
 				}
 			}
 			return TransferResult(envSetNode(node, union(results), env), jumps);
@@ -429,6 +485,7 @@ export function typeChecker(): Instance<Output> {
 			// The value of the assignment expression is the same as the new value of the LHS.
 			// So we can reuse the logic of `typeOfBinaryExpression` to calculate the type.
 			const type = typeOfBinaryExpression(node, env);
+			
 			return applyNarrowing(reference, type, env, true);
 		}
 		function transferStatement(_node: ts.Node, env: Environment): Environment {
@@ -614,16 +671,31 @@ export function typeChecker(): Instance<Output> {
 				const intersected = override ? narrowedPropertyType : intersect([propType, narrowedPropertyType]);
 				if (intersected === types.primitiveNever) return types.primitiveNever;
 				if (t instanceof types.ObjectType) {
-					return new types.ObjectType(
+					return types.widenObject(new types.ObjectType(
 						new Map([[property, intersected]]),
 						t,
 						t.name,
 						t.instantiatedTypeParameters,
 						t.typeParameters,
 						t.maxDepth
-					);
+					));
 				}
-				return types.primitiveNever;
+				
+				if (t instanceof types.IntersectionType) {
+					const parts: types.Type[] = [...t.intersectionParts];
+					let found = false;
+					for (let i = 0; i < parts.length; i++) {
+						if (parts[i] instanceof types.ObjectType) {
+							parts[i] = narrowProperty(parts[i], property, narrowedPropertyType, override);
+							found = true;
+						}
+					}
+					if (found) return intersect(parts);
+				}
+				return intersect([
+					t,
+					new types.ObjectType(new Map([[property, intersected]]))
+				]);
 			});
 		}
 
@@ -684,7 +756,11 @@ export function typeChecker(): Instance<Output> {
 			if (reference.property.length === 0) {
 				// Narrowing to `never` means that the code is unreachable
 				if (type === types.primitiveNever && !override) return bottom;
-				return envSetSymbol(scopeResolver.get(reference.expression), type, env);
+				if (reference.expression.kind === ts.SyntaxKind.ThisKeyword) {
+					return envSetThisType(type, env);
+				} else {
+					return envSetSymbol(scopeResolver.get(reference.expression), type, env);
+				}
 			}
 			const parentReference: types.NarrowingReference = {
 				expression: reference.expression,
@@ -752,6 +828,10 @@ export function typeChecker(): Instance<Output> {
 					return typeOfTypeOfExpression(node as ts.TypeOfExpression, env);
 				case ts.SyntaxKind.PropertyAccessExpression:
 					return typeOfPropertyAccess(node as ts.PropertyAccessExpression, env);
+				case ts.SyntaxKind.ElementAccessExpression:
+					return typeOfElementAccess(node as ts.ElementAccessExpression, env);
+				case ts.SyntaxKind.RegularExpressionLiteral:
+					return typeHost.globalRegExp;
 
 				// Casts
 				case ts.SyntaxKind.NonNullExpression:
@@ -799,7 +879,7 @@ export function typeChecker(): Instance<Output> {
 				case ts.SyntaxKind.ExclamationToken:
 					return types.primitiveBoolean;
 				default:
-					return unreachable(node.operator, "Unexpected binary operator");
+					return unreachable(node.operator, "Unexpected prefix unary operator");
 			}
 		}
 		function typeOfPostfixUnaryExpression(node: ts.PostfixUnaryExpression, env: Environment) {
@@ -887,11 +967,14 @@ export function typeChecker(): Instance<Output> {
 				case ts.SyntaxKind.GreaterThanToken:
 					return types.primitiveBoolean;
 				case ts.SyntaxKind.PlusToken:
+				case ts.SyntaxKind.PlusEqualsToken:
 					return typeOfBinaryPlus(left, right, env);
 				case ts.SyntaxKind.AmpersandAmpersandToken:
 					return typeOfBinaryLogicalOperator(left, right, true, env);
 				case ts.SyntaxKind.BarBarToken:
 					return typeOfBinaryLogicalOperator(left, right, false, env);
+				case ts.SyntaxKind.InstanceOfKeyword:
+					return types.primitiveBoolean;
 				default:
 					throw new Error("Unexpected binary operator: " + ts.SyntaxKind[operator]);
 			}
@@ -923,10 +1006,11 @@ export function typeChecker(): Instance<Output> {
 			const typeCondition = typeOf(expression.condition, env);
 			const trueReachable = narrowTypeAfterCondition(typeCondition, true) !== types.primitiveNever;
 			const falseReachable = narrowTypeAfterCondition(typeCondition, false) !== types.primitiveNever;
-			return union([
+			const type = union([
 				trueReachable ? typeOf(expression.whenTrue, env) : types.primitiveNever,
 				falseReachable ? typeOf(expression.whenFalse, env) : types.primitiveNever
 			]);
+			return type;
 		}
 		function typeOfTypeOfExpression(expression: ts.TypeOfExpression, env: Environment) {
 			return union(
@@ -954,7 +1038,7 @@ export function typeChecker(): Instance<Output> {
 					return types.primitiveAny;
 				}
 			}
-			return new types.ObjectType(members);
+			return types.widenObject(new types.ObjectType(members));
 		}
 		function typeOfArrayLiteral(node: ts.ArrayLiteralExpression, env: Environment) {
 			const t: types.Type[] = [];
@@ -979,7 +1063,101 @@ export function typeChecker(): Instance<Output> {
 		function typeOfPropertyAccess(node: ts.PropertyAccessExpression, env: Environment) {
 			return propertyType(typeOf(node.expression, env), node.name.text) || types.primitiveAny;
 		}
+		function typeOfElementAccess(node: ts.ElementAccessExpression, env: Environment) {
+			if (node.argumentExpression === undefined) return types.primitiveAny;
+			const props = types.propertyNamesForType(typeOf(node.argumentExpression, env));
+			if (props === undefined) return types.primitiveAny;
+			return union(
+				props.map(
+					prop => propertyType(typeOf(node.expression, env), prop) || types.primitiveAny
+				)
+			);
+		}
 
+		function loadRootObjectType(name: string) {
+			return new types.LazyType(() => {
+				const nodes = rootObjectTypes.get(name);
+				const signatures: types.Type[] = [];
+				if (nodes === undefined) {
+					throw new Error("Type not registered in loadRootObjectType");
+				}
+				const objTypes: types.ObjectType[] = [];
+				for (const node of nodes) {
+					const extendsTypes = findExtendsClauseTypes(node.heritageClauses);
+					const typeParameters = node.typeParameters === undefined ? []
+						: node.typeParameters.map(param => new types.TypeParameter(
+							param.constraint && fromTsType(param.constraint),
+							param.name.text
+						));
+
+					const members = new Map<types.PropertyName, types.Type>();
+					for (const m of node.members) {
+						const nameType = getMemberDeclarationType(m, typeParameters);
+						if (nameType === undefined) continue;
+						const [memberName, type] = nameType;
+						members.set(memberName, types.limitDepth(type, types.defaultMaxDepth - 1));
+					}
+
+					let object = new types.ObjectType(members, undefined, name, [], typeParameters);
+
+					if (extendsTypes !== undefined) {
+						object = types.extendObject(typeHost, object, types.intersectObjects(
+							typeHost,
+							extendsTypes.map(type => fromTsType(type))
+								.filter(type => {
+									if (type instanceof types.ObjectType) return true;
+									// console.log("Expected object type in extends clause, got " + type.show());
+									return false;
+								}) as types.ObjectType[]
+						), true);
+					}
+
+					objTypes.push(object);
+				}
+
+				let objectType: types.ObjectType;
+				if (objTypes.length === 1) {
+					objectType = objTypes[0];
+				} else {
+					objectType = types.intersectObjects(typeHost, objTypes);
+				}
+				return intersect([objectType, ...signatures]);
+
+				function findExtendsClauseTypes(clauses?: ts.HeritageClause[]) {
+					if (clauses === undefined) return undefined;
+					for (const clause of clauses) {
+						if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+							return clause.types;
+						}
+					}
+					return undefined;
+				}
+				function getMemberDeclarationType(node: ts.ClassElement | ts.TypeElement, typeParameters: types.TypeParameter[]): [types.PropertyName, types.Type] | undefined {
+					if (node.kind === ts.SyntaxKind.MethodDeclaration || node.kind === ts.SyntaxKind.MethodSignature) {
+						const name = (node as ts.MethodDeclaration | ts.MethodSignature).name;
+						return [types.propertyNameToKey(name), new types.LazyType(() => types.fromTsType(typeHost, node as ts.MethodDeclaration | ts.MethodSignature, typeParameters))];
+					} else if (node.kind === ts.SyntaxKind.PropertyDeclaration || node.kind === ts.SyntaxKind.PropertySignature) {
+						const { name, type, questionToken } = node as ts.PropertyDeclaration | ts.PropertySignature;
+						let t: types.Type = type === undefined ? types.primitiveAny : new types.LazyType(() => types.fromTsType(typeHost, type, typeParameters));
+						if (questionToken) {
+							t = union([t, types.primitiveUndefined]);
+						}
+						return [types.propertyNameToKey(name), t];
+					} else if (node.kind === ts.SyntaxKind.IndexSignature) {
+						const indexer = types.fromTsIndexer(typeHost, node as ts.IndexSignatureDeclaration, typeParameters, types.defaultMaxDepth - 1);
+						const { type } = node as ts.IndexSignatureDeclaration;
+						return [indexer, type === undefined ? types.primitiveAny : new types.LazyType(() => types.fromTsType(typeHost, type, typeParameters))];
+					} else if (node.kind === ts.SyntaxKind.ConstructSignature || node.kind === ts.SyntaxKind.CallSignature) {
+						const type = fromTsType(node as ts.CallSignatureDeclaration | ts.ConstructSignatureDeclaration);
+						signatures.push(type);
+					} else if (node.kind === ts.SyntaxKind.Constructor) {
+						
+					}
+
+					return undefined;
+				}
+			});
+		}
 		function initRootTypes(file: ts.SourceFile) {
 			ts.forEachChild(file, init);
 
@@ -997,94 +1175,39 @@ export function typeChecker(): Instance<Output> {
 			function initClassOrInterface(node: ts.ClassDeclaration | ts.InterfaceDeclaration) {
 				if (node.name === undefined) return;
 				const name = node.name.text;
-				rootTypes.set(name, new types.LazyType(() => {
-					let extendsType: types.Type | undefined;
-					const extendsTypes = findExtendsClauseTypes(node.heritageClauses);
-					const typeParameters = node.typeParameters === undefined ? []
-						: node.typeParameters.map(param => new types.TypeParameter(
-							param.constraint && fromTsType(param.constraint),
-							param.name.text
-						));
 
-					if (extendsTypes !== undefined) {
-						if (node.kind === ts.SyntaxKind.ClassDeclaration) {
-							if (extendsTypes.length !== 1) {
-								console.log("Classes may only extend one class");
-							} else {
-								extendsType = types.fromTsType(typeHost, extendsTypes[0], typeParameters);
-							}
-						} else {
-							if (extendsTypes.length === 1) {
-								extendsType = types.fromTsType(typeHost, extendsTypes[0], typeParameters);
-							} else {
-								// TODO: Extends multiple types
-								console.log("Extending multiple types is not yet supported");
-							}
-						}
-					}
-
-					if (extendsType !== undefined) {
-						extendsType = types.resolve(extendsType);
-						
-						if (!(extendsType instanceof types.ObjectType)) {
-							console.log("Classes and interfaces may only extend object types");
-							extendsType = undefined;
-						}
-					}
-
-					const members = new Map<types.PropertyName, types.Type>();
-					for (const m of node.members) {
-						// MethodDeclaration
-						// ConstructorDeclaration
-						// GetAccessorDeclaration
-						// SetAccessorDeclaration
-						// IndexSignatureDeclaration
-						// PropertyDeclaration
-						const nameType = getMemberDeclarationType(m, typeParameters);
-						if (nameType === undefined) continue;
-						const [name, type] = nameType;
-						members.set(name, types.limitDepth(type, types.defaultMaxDepth - 1));
-					}
-
-					return new types.ObjectType(members, extendsType, name, [], typeParameters);
-				}));
-			}
-			function findExtendsClauseTypes(clauses?: ts.HeritageClause[]) {
-				if (clauses === undefined) return undefined;
-				for (const clause of clauses) {
-					if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
-						return clause.types;
-					}
+				rootTypes.set(name, loadRootObjectType);
+				const nodes = rootObjectTypes.get(name);
+				if (nodes === undefined) {
+					rootObjectTypes.set(name, [node]);
+				} else {
+					nodes.push(node);
 				}
-				return undefined;
-			}
-			function getMemberDeclarationType(node: ts.ClassElement | ts.TypeElement, typeParameters: types.TypeParameter[]): [types.PropertyName, types.Type] | undefined {
-				if (node.kind === ts.SyntaxKind.MethodDeclaration) {
-					const name = (node as ts.MethodDeclaration).name;
-					return [types.propertyNameToKey(name), new types.LazyType(() => types.fromTsType(typeHost, node as ts.MethodDeclaration, typeParameters))];
-				} else if (node.kind === ts.SyntaxKind.PropertyDeclaration || node.kind === ts.SyntaxKind.PropertySignature) {
-					const { name, type, questionToken } = node as ts.PropertyDeclaration | ts.PropertySignature;
-					let t: types.Type = type === undefined ? types.primitiveAny : new types.LazyType(() => types.fromTsType(typeHost, type, typeParameters));
-					if (questionToken) {
-						t = union([t, types.primitiveUndefined]);
-					}
-					return [types.propertyNameToKey(name), t];
-				} else if (node.kind === ts.SyntaxKind.IndexSignature) {
-					const indexer = types.fromTsIndexer(typeHost, node as ts.IndexSignatureDeclaration);
-					const { type } = node as ts.IndexSignatureDeclaration;
-					return [indexer, type === undefined ? types.primitiveAny : new types.LazyType(() => types.fromTsType(typeHost, type, typeParameters))];
-				}
-				return undefined;
 			}
 			function initTypeAlias(node: ts.TypeAliasDeclaration) {
 				if (node.typeParameters) {
 					console.log("Generics in a type alias are not supported");
 				}
-				rootTypes.set(node.name.text, new types.LazyType(() => fromTsType(node.type)));
+				rootTypes.set(node.name.text, () => fromTsType(node.type));
 			}
 		}
 		function rootType(name: string) {
-			return rootTypes.get(name);
+			const value = rootTypes.get(name);
+			if (value === undefined) {
+				return undefined;
+			}
+			if (value instanceof types.TypeBase) {
+				return value;
+			}
+			let result: types.Type;
+			rootTypes.set(name, new types.LazyType(() => {
+				if (result === undefined) {
+					throw new Error("Circular type not supported");
+				}
+				return result;
+			}));
+			result = value(name);
+			return result;
 		}
 		function rootObjectType(name: string) {
 			const type = rootType(name);
@@ -1105,7 +1228,15 @@ export function typeChecker(): Instance<Output> {
 				let type: types.Type;
 				if (symbol.flags & ts.SymbolFlags.Variable) {
 					// Variable
+					const declaration = symbol.valueDeclaration;
 					type = types.primitiveUndefined;
+					if (declaration) {
+						if ((ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Ambient) && declaration.kind === ts.SyntaxKind.VariableDeclaration && (declaration as ts.VariableDeclaration).type) {
+							type = fromTsType((declaration as ts.VariableDeclaration).type!);
+						} else if (declaration.kind === ts.SyntaxKind.Parameter) {
+							continue;
+						}
+					}
 				} else if (symbol.flags & ts.SymbolFlags.Function) {
 					// Function
 					const declaration = symbol.valueDeclaration as ts.FunctionLikeDeclaration;
