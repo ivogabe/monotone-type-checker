@@ -50,7 +50,7 @@ function factory() {
     // be sure of no error when locale is not exist.
     locale = locales[locale] ? locale : (locales[defaultLocale] ? defaultLocale : 'en');
     // if (! locales[locale]) locale = defaultLocale;
-    var i = 0;
+    var i = 0,
       agoin = diff < 0 ? 1 : 0; // timein or timeago
     diff = Math.abs(diff);
 
